@@ -1,17 +1,33 @@
 import csv
 import time
-import numpy 
+import numpy
 import operator
 from random import choice
 import ctypes
 import collections
 import heapq
 
+import traffic_assignment
+
 
 # =========================
-# -*- data block define -*- 
+# -*- data block define -*-
 # =========================
 MAX_LABEL_COST_IN_SHORTEST_PATH = 10000
+
+# ==========================================
+# -*- data block traffic assignment mode -*-
+# ==========================================
+# route choice model used to load agents onto the network:
+#   'AON'   one-shot all-or-nothing shortest paths (original behavior)
+#   'UE_FW' static user equilibrium solved with Frank-Wolfe
+#   'UE_GP' static user equilibrium solved with gradient projection
+ASSIGNMENT_MODE = 'UE_FW'
+UE_MAX_ITERATIONS = 100
+UE_RELATIVE_GAP_TOLERANCE = 1e-4
+# OD demand is read as veh/h against hourly link capacities; raise this
+# multiplier to stress the network beyond the raw agent counts
+UE_DEMAND_MULTIPLIER = 1.0
 
 # ==========================================
 # -*- data block simulation time horizon -*-
@@ -391,21 +407,33 @@ def time_int_to_str(time_int):
         return str(time_int)
 
 
+def g_decode_fixed_path(network, agent):
+    """ rebuild the link sequence of an agent whose path is given in the
+    input file (path_fixed_flag == 1) """
+    agent.path_node_seq_no_list = [int(i) for i in agent.path_node_seq_str.strip(";").split(";")]
+    if len(agent.path_node_seq_no_list) > 1:
+        init_node_index = 0
+        while (init_node_index+1 < len(agent.path_node_seq_no_list)):
+            key = agent.path_node_seq_no_list[init_node_index]*10000 + agent.path_node_seq_no_list[init_node_index+1]
+            link_seq_no = network.node_seq_to_link_seq[key]
+            agent.path_link_seq_no_list.append(link_seq_no)
+            init_node_index += 1
+        agent.feasible_path_exist_flag = True
+
+
 def g_find_shortest_path_for_agent(network):
-    
-    # step 1: find shortest path if needed 
+
+    # step 1: find shortest path if needed
     for i in range(network.agenet_size):
         # no need to compute a path if the agent's path is fixed
-        if (network.agent_list[i].path_fixed_flag==1):
-            network.agent_list[i].path_node_seq_no_list=[int(i) for i in network.agent_list[i].path_node_seq_str.strip(";").split(";")]
-            if len(network.agent_list[i].path_node_seq_no_list)>1:
-                init_node_index=0
-                while(init_node_index+1<len(network.agent_list[i].path_node_seq_no_list)):
-                    key=network.agent_list[i].path_node_seq_no_list[init_node_index]*10000+network.agent_list[i].path_node_seq_no_list[init_node_index+1]
-                    link_seq_no=network.node_seq_to_link_seq[key]
-                    network.agent_list[i].path_link_seq_no_list.append(link_seq_no)
-                network.agent_list[i].feasible_path_exist_flag = True
-            continue         
+        if (int(network.agent_list[i].path_fixed_flag)==1):
+            g_decode_fixed_path(network, network.agent_list[i])
+            continue
+
+        # skip agents whose origin or destination is not in node.csv
+        if (network.agent_list[i].o_node_id not in network.internal_node_seq_no_dict
+                or network.agent_list[i].d_node_id not in network.internal_node_seq_no_dict):
+            continue
 
         # step 2 build SP tree
         return_value = network.optimal_label_correcting(
@@ -540,7 +568,153 @@ def g_TrafficSimulation(node_list, link_list, agent_list, agent_td_list_dict):
                     link_list[link_seq_no].td_link_out_flow_capacity[relative_t] -= 1 
 
 
-def g_ReadInputData(node_list, 
+def g_UserEquilibriumAssignment(network):
+    """ solve the static traffic assignment problem to user equilibrium
+    (Wardrop's first principle) and give every agent a UE-consistent path
+
+    OD demand is aggregated from the agent file (PCE-weighted). The solver
+    (Frank-Wolfe or gradient projection, see ASSIGNMENT_MODE) returns the
+    equilibrium path flow shares per OD pair; agents of each OD pair are
+    apportioned across those paths so the simulated vehicle counts reproduce
+    the equilibrium link flows.
+    """
+    ta_links = [
+        traffic_assignment.AssignmentLink(link.link_seq_no,
+                                          link.from_node_seq_no,
+                                          link.to_node_seq_no,
+                                          link.free_flow_travel_time_in_min,
+                                          link.link_capacity,
+                                          link.BPR_alpha,
+                                          link.BPR_beta)
+        for link in network.link_list
+    ]
+
+    # step 1: build the OD demand table from the agent list
+    od_demand = {}
+    od_agents = {}
+    unknown_node_agent_count = 0
+    for agent in network.agent_list:
+        if int(agent.path_fixed_flag) == 1:
+            g_decode_fixed_path(network, agent)
+            continue
+        if (agent.o_node_id not in network.internal_node_seq_no_dict
+                or agent.d_node_id not in network.internal_node_seq_no_dict):
+            unknown_node_agent_count += 1
+            continue
+        o_node = network.internal_node_seq_no_dict[agent.o_node_id]
+        d_node = network.internal_node_seq_no_dict[agent.d_node_id]
+        if o_node == d_node:
+            continue
+        od = (o_node, d_node)
+        od_demand[od] = od_demand.get(od, 0.0) + float(agent.PCE_factor) * UE_DEMAND_MULTIPLIER
+        od_agents.setdefault(od, []).append(agent)
+
+    if unknown_node_agent_count:
+        print('warning:', unknown_node_agent_count, 'agents reference node ids'
+              ' that are not in node.csv and were skipped')
+
+    # step 2: solve for the user equilibrium link/path flows
+    problem = traffic_assignment.UEAssignment(len(network.node_list),
+                                              ta_links, od_demand)
+    if ASSIGNMENT_MODE == 'UE_GP':
+        result = problem.solve_gradient_projection(
+            max_iterations=UE_MAX_ITERATIONS,
+            rel_gap_tolerance=UE_RELATIVE_GAP_TOLERANCE)
+    else:
+        result = problem.solve_frank_wolfe(
+            max_iterations=UE_MAX_ITERATIONS,
+            rel_gap_tolerance=UE_RELATIVE_GAP_TOLERANCE)
+    print('%s converged to relative gap %.6f in %d iterations'
+          % (ASSIGNMENT_MODE, result.relative_gap, len(result.iteration_log)))
+    if result.unreachable_od_list:
+        print('warning:', len(result.unreachable_od_list),
+              'OD pairs have no feasible path and were skipped')
+
+    # step 3: hand each agent one of its OD pair's equilibrium paths
+    for od, agents in od_agents.items():
+        shares = result.od_path_flows.get(od)
+        if not shares:
+            continue
+        counts = traffic_assignment.apportion_counts(shares, len(agents))
+        agent_iter = iter(agents)
+        for path, agent_count in counts.items():
+            for _ in range(agent_count):
+                agent = next(agent_iter)
+                agent.path_link_seq_no_list = list(path)
+                agent.path_node_seq_no_list = (
+                    [network.link_list[path[0]].from_node_seq_no]
+                    + [network.link_list[seq].to_node_seq_no for seq in path])
+                agent.path_cost = sum(result.link_times[seq] for seq in path)
+                agent.feasible_path_exist_flag = True
+    return result
+
+
+def g_OutputUEFiles(network, result):
+    """ write the user equilibrium solution: link flows, route flows and the
+    convergence trace of the assignment algorithm """
+
+    with open('ue_link_performance.csv', 'w', newline='') as fp:
+        writer = csv.writer(fp)
+        writer.writerow(["link_id", "from_node_id", "to_node_id", "length",
+                         "capacity_per_hour", "fftt_in_min", "ue_volume",
+                         "ue_travel_time_in_min", "voc_ratio", "speed"])
+        for link in network.link_list:
+            volume = result.link_flows[link.link_seq_no]
+            travel_time = result.link_times[link.link_seq_no]
+            writer.writerow([
+                link.link_seq_no + 1,
+                link.external_from_node,
+                link.external_to_node,
+                link.length,
+                link.link_capacity,
+                link.free_flow_travel_time_in_min,
+                volume,
+                travel_time,
+                volume / max(0.00001, link.link_capacity),
+                link.length / max(0.00001, travel_time / 60.0),
+            ])
+
+    with open('ue_route_assignment.csv', 'w', newline='') as fp:
+        writer = csv.writer(fp)
+        writer.writerow(["o_node_id", "d_node_id", "demand", "path_share",
+                         "path_volume", "path_travel_time_in_min",
+                         "node_sequence"])
+        for (o_node, d_node), shares in sorted(result.od_path_flows.items()):
+            demand = result.od_demand.get((o_node, d_node), 0.0)
+            for path, share in sorted(shares.items(), key=lambda kv: -kv[1]):
+                node_seq = ([network.link_list[path[0]].from_node_seq_no]
+                            + [network.link_list[seq].to_node_seq_no for seq in path])
+                writer.writerow([
+                    network.external_node_id_dict[o_node],
+                    network.external_node_id_dict[d_node],
+                    demand,
+                    share,
+                    demand * share,
+                    sum(result.link_times[seq] for seq in path),
+                    ';'.join(str(network.external_node_id_dict[i]) for i in node_seq),
+                ])
+
+    with open('ue_convergence.csv', 'w', newline='') as fp:
+        writer = csv.writer(fp)
+        writer.writerow(["iteration", "step_size", "beckmann_objective",
+                         "total_system_travel_time", "shortest_path_travel_time",
+                         "relative_gap"])
+        for row in result.iteration_log:
+            writer.writerow([row['iteration'], row['step_size'],
+                             row['objective'], row['tstt'], row['sptt'],
+                             row['rel_gap']])
+
+
+def g_read_csv_field(line, key, default):
+    """ read an optional GMNS column: return default when the column is
+    missing from the file or the cell is blank """
+    value = line.get(key)
+    if value is None or str(value).strip() == '':
+        return default
+    return value
+
+
+def g_ReadInputData(node_list,
                     link_list, 
                     agent_list,
                     internal_node_seq_no_dict,
@@ -577,31 +751,40 @@ def g_ReadInputData(node_list,
     print('the number of nodes is', g_number_of_nodes)
 
     #step 2: read input_link
+    # GMNS link files in the wild differ: lengths may be meters (osm2gmns
+    # default) or km, and lanes / capacity / VDF_alpha1 / VDF_beta1 columns
+    # may be blank or absent. Read every row first so the length unit can be
+    # autodetected from the median, and fall back to standard BPR defaults.
     with open('link.csv', 'r', encoding='utf-8') as fp:
-        reader = csv.DictReader(fp)
-        link_seq_no = 0
-        for line in reader:
-            from_node_no = internal_node_seq_no_dict[int(line['from_node_id'])]
-            to_node_no = internal_node_seq_no_dict[int(line['to_node_id'])]
-            link = Link(link_seq_no, 
-                        from_node_no, 
-                        to_node_no,
-                        int(line['from_node_id']),
-                        int(line['to_node_id']),
-                        line['length'],
-                        line['lanes'],
-                        line['free_speed'],
-                        line['capacity'],
-                        line['link_type'],
-                        line['VDF_alpha1'],
-                        line['VDF_beta1'])
-            node_list[link.from_node_seq_no].outgoing_link_list.append(link)
-            node_list[link.to_node_seq_no].incoming_link_list.append(link)
-            key=link.from_node_seq_no*10000+link.to_node_seq_no
-            node_seq_to_link_seq[key]=link_seq_no
-            link_list.append(link)
-            link_seq_no += 1
-        g_number_of_links = link_seq_no
+        rows = list(csv.DictReader(fp))
+    lengths = sorted(float(line['length']) for line in rows)
+    median_length = lengths[len(lengths) // 2] if lengths else 0.0
+    length_scale = 0.001 if median_length > 10.0 else 1.0
+    if length_scale != 1.0:
+        print('link lengths detected as meters, converting to km')
+    link_seq_no = 0
+    for line in rows:
+        from_node_no = internal_node_seq_no_dict[int(line['from_node_id'])]
+        to_node_no = internal_node_seq_no_dict[int(line['to_node_id'])]
+        link = Link(link_seq_no,
+                    from_node_no,
+                    to_node_no,
+                    int(line['from_node_id']),
+                    int(line['to_node_id']),
+                    float(line['length']) * length_scale,
+                    g_read_csv_field(line, 'lanes', 1),
+                    g_read_csv_field(line, 'free_speed', 30),
+                    g_read_csv_field(line, 'capacity', 1000),
+                    g_read_csv_field(line, 'link_type', 1),
+                    g_read_csv_field(line, 'VDF_alpha1', 0.15),
+                    g_read_csv_field(line, 'VDF_beta1', 4))
+        node_list[link.from_node_seq_no].outgoing_link_list.append(link)
+        node_list[link.to_node_seq_no].incoming_link_list.append(link)
+        key=link.from_node_seq_no*10000+link.to_node_seq_no
+        node_seq_to_link_seq[key]=link_seq_no
+        link_list.append(link)
+        link_seq_no += 1
+    g_number_of_links = link_seq_no
     print('the number of links is', g_number_of_links)
 
     #step 3:read input_agent
@@ -785,17 +968,23 @@ if __name__=="__main__":
                     network.zone_to_nodes_dict,network.node_seq_to_link_seq)
 
     network.allocate()
-    
+
     begin_time = time.time()
 
-    g_find_shortest_path_for_agent(network)
-    g_TrafficSimulation(network.node_list, network.link_list, 
+    ue_result = None
+    if ASSIGNMENT_MODE in ('UE_FW', 'UE_GP'):
+        ue_result = g_UserEquilibriumAssignment(network)
+    else:
+        g_find_shortest_path_for_agent(network)
+    g_TrafficSimulation(network.node_list, network.link_list,
                         network.agent_list, network.agent_td_list_dict)
 
     end_time = time.time()
-    g_OutputFiles(network.link_list, 
-                  network.agent_list, 
+    g_OutputFiles(network.link_list,
+                  network.agent_list,
                   network.external_node_id_dict)
-    print('simulation processing time: {0: .2f}'.format(end_time-begin_time) 
+    if ue_result is not None:
+        g_OutputUEFiles(network, ue_result)
+    print('simulation processing time: {0: .2f}'.format(end_time-begin_time)
           + 's')
    
